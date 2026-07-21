@@ -26,8 +26,8 @@ from .sandbox import (
 
 __all__ = ("Dune", "DuneAsync")
 
-_TERMINAL_FAILURE_STATES = {SandboxState.ERROR, SandboxState.DELETED}
-_LIVE_STATES = {SandboxState.PENDING, SandboxState.STARTED}
+_TERMINAL_FAILURE_STATES = {SandboxState.FAILED, SandboxState.COMPLETED, SandboxState.NOT_FOUND}
+_LIVE_STATES = {SandboxState.PENDING, SandboxState.READY}
 
 # Fixed interval between readiness polls in create()/batch_create().
 _POLL_INTERVAL = 0.5
@@ -35,6 +35,26 @@ _POLL_INTERVAL = 0.5
 
 def _apply_namespace(params: SandboxParams, default_ns: str | None) -> SandboxParams:
     return replace(params, namespace=params.namespace or default_ns)
+
+
+def _terminal_error_sync(http: SyncHttpClient, sid: str, state: SandboxState) -> DuneError:
+    reason = None
+    try:
+        reason = http.get_json(f"/v1/sandboxes/{sid}").get("termination_reason")
+    except DuneError:
+        pass
+    detail = f": {reason}" if reason else ""
+    return DuneError(f"sandbox {sid} reached terminal state {state.value} before ready{detail}")
+
+
+async def _terminal_error_async(ahttp: AsyncHttpClient, sid: str, state: SandboxState) -> DuneError:
+    reason = None
+    try:
+        reason = (await ahttp.get_json(f"/v1/sandboxes/{sid}")).get("termination_reason")
+    except DuneError:
+        pass
+    detail = f": {reason}" if reason else ""
+    return DuneError(f"sandbox {sid} reached terminal state {state.value} before ready{detail}")
 
 
 def _wait_ready_sync(sandboxes: Sequence[Sandbox], timeout: int | None) -> None:
@@ -47,19 +67,17 @@ def _wait_ready_sync(sandboxes: Sequence[Sandbox], timeout: int | None) -> None:
         states = http.post_json("/v1/sandboxes/status", {"ids": list(pending)})["states"]
         for sid, sb in list(pending.items()):
             sb.state = SandboxState(states.get(sid, SandboxState.PENDING.value))
-            if sb.state == SandboxState.STARTED:
+            if sb.state == SandboxState.READY:
                 del pending[sid]
             elif sb.state in _TERMINAL_FAILURE_STATES:
-                raise DuneError(
-                    f"sandbox {sid} reached terminal state {sb.state.value} before STARTED"
-                )
+                raise _terminal_error_sync(http, sid, sb.state)
         if not pending:
             return
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise DuneTimeoutError(
-                    f"{len(pending)} sandbox(es) did not reach STARTED within {timeout}s",
+                    f"{len(pending)} sandbox(es) did not reach ready within {timeout}s",
                     pending=list(pending),
                 )
             time.sleep(min(_POLL_INTERVAL, remaining))
@@ -77,12 +95,10 @@ async def _wait_ready_async(sandboxes: Sequence[AsyncSandbox]) -> None:
         states = data["states"]
         for sid, sb in list(pending.items()):
             sb.state = SandboxState(states.get(sid, SandboxState.PENDING.value))
-            if sb.state == SandboxState.STARTED:
+            if sb.state == SandboxState.READY:
                 del pending[sid]
             elif sb.state in _TERMINAL_FAILURE_STATES:
-                raise DuneError(
-                    f"sandbox {sid} reached terminal state {sb.state.value} before STARTED"
-                )
+                raise await _terminal_error_async(ahttp, sid, sb.state)
         if pending:
             await asyncio.sleep(_POLL_INTERVAL)
 
@@ -136,7 +152,13 @@ class _SyncSandboxNamespace:
         self._ssh_http = ssh_http
         self._ns = default_ns
 
-    def create(self, params: SandboxParams, *, timeout: int | None = 120) -> Sandbox:
+    def create(
+        self,
+        params: SandboxParams,
+        *,
+        auto_extend_seconds: int | None = None,
+        timeout: int | None = 120,
+    ) -> Sandbox:
         if timeout is not None and timeout < 0:
             raise DuneValidationError("timeout must be non-negative")
         eff = _apply_namespace(params, self._ns)
@@ -146,6 +168,7 @@ class _SyncSandboxNamespace:
             self._ssh_http,
             self._http.post_json("/v1/sandboxes", eff.to_wire()),
         )
+        sb.auto_extend_seconds = auto_extend_seconds
         if timeout == 0:
             return sb
         try:
@@ -156,7 +179,12 @@ class _SyncSandboxNamespace:
         return sb
 
     def batch_create(
-        self, params: SandboxParams, count: int, *, timeout: int | None = 120
+        self,
+        params: SandboxParams,
+        count: int,
+        *,
+        auto_extend_seconds: int | None = None,
+        timeout: int | None = 120,
     ) -> list[Sandbox]:
         if timeout is not None and timeout < 0:
             raise DuneValidationError("timeout must be non-negative")
@@ -168,6 +196,8 @@ class _SyncSandboxNamespace:
             sandbox_from_wire(self._http, self._data_http, self._ssh_http, d)
             for d in _batch_items(data)
         ]
+        for sb in sandboxes:
+            sb.auto_extend_seconds = auto_extend_seconds
         if len(sandboxes) != count:
             self._safe_delete_all(sandboxes)
             raise DuneError(f"service returned {len(sandboxes)} sandboxes for count={count}")
@@ -180,6 +210,16 @@ class _SyncSandboxNamespace:
             raise
         return sandboxes
 
+    def get(self, sandbox: Sandbox | str) -> Sandbox:
+        data = self._http.get_json(f"/v1/sandboxes/{_sid(sandbox)}")
+        return sandbox_from_wire(self._http, self._data_http, self._ssh_http, data)
+
+    def extend(self, sandbox: Sandbox | str, seconds: int) -> Sandbox:
+        data = self._http.post_json(
+            f"/v1/sandboxes/{_sid(sandbox)}/extend", {"seconds": seconds}
+        )
+        return sandbox_from_wire(self._http, self._data_http, self._ssh_http, data)
+
     def delete(self, sandbox: Sandbox | str) -> None:
         sid = _sid(sandbox)
         try:
@@ -187,7 +227,7 @@ class _SyncSandboxNamespace:
         except DuneNotFoundError:
             pass
         if isinstance(sandbox, Sandbox):
-            sandbox.state = SandboxState.DELETED
+            sandbox.state = SandboxState.COMPLETED
 
     def list(self) -> list[Sandbox]:
         out: list[Sandbox] = []
@@ -223,10 +263,13 @@ class _AsyncSandboxNamespace:
         self._ssh_http = ssh_http
         self._ns = default_ns
 
-    async def create(self, params: SandboxParams) -> AsyncSandbox:
+    async def create(
+        self, params: SandboxParams, *, auto_extend_seconds: int | None = None
+    ) -> AsyncSandbox:
         eff = _apply_namespace(params, self._ns)
         data = await self._ahttp.post_json("/v1/sandboxes", eff.to_wire())
         sb = async_sandbox_from_wire(self._ahttp, self._http, self._adata_http, self._ssh_http, data)
+        sb.auto_extend_seconds = auto_extend_seconds
         try:
             await _wait_ready_async([sb])
         except BaseException:
@@ -234,7 +277,9 @@ class _AsyncSandboxNamespace:
             raise
         return sb
 
-    async def batch_create(self, params: SandboxParams, count: int) -> list[AsyncSandbox]:
+    async def batch_create(
+        self, params: SandboxParams, count: int, *, auto_extend_seconds: int | None = None
+    ) -> list[AsyncSandbox]:
         eff = _apply_namespace(params, self._ns)
         data = await self._ahttp.post_json(
             "/v1/sandboxes/batch", {"params": eff.to_wire(), "count": count}
@@ -243,6 +288,8 @@ class _AsyncSandboxNamespace:
             async_sandbox_from_wire(self._ahttp, self._http, self._adata_http, self._ssh_http, d)
             for d in _batch_items(data)
         ]
+        for sb in sandboxes:
+            sb.auto_extend_seconds = auto_extend_seconds
         if len(sandboxes) != count:
             await asyncio.shield(self._safe_delete_all(sandboxes))
             raise DuneError(f"service returned {len(sandboxes)} sandboxes for count={count}")
@@ -253,6 +300,20 @@ class _AsyncSandboxNamespace:
             raise
         return sandboxes
 
+    async def get(self, sandbox: AsyncSandbox | str) -> AsyncSandbox:
+        data = await self._ahttp.get_json(f"/v1/sandboxes/{_sid(sandbox)}")
+        return async_sandbox_from_wire(
+            self._ahttp, self._http, self._adata_http, self._ssh_http, data
+        )
+
+    async def extend(self, sandbox: AsyncSandbox | str, seconds: int) -> AsyncSandbox:
+        data = await self._ahttp.post_json(
+            f"/v1/sandboxes/{_sid(sandbox)}/extend", {"seconds": seconds}
+        )
+        return async_sandbox_from_wire(
+            self._ahttp, self._http, self._adata_http, self._ssh_http, data
+        )
+
     async def delete(self, sandbox: AsyncSandbox | str) -> None:
         sid = _sid(sandbox)
         try:
@@ -260,7 +321,7 @@ class _AsyncSandboxNamespace:
         except DuneNotFoundError:
             pass
         if isinstance(sandbox, AsyncSandbox):
-            sandbox.state = SandboxState.DELETED
+            sandbox.state = SandboxState.COMPLETED
 
     def list(self) -> list[AsyncSandbox]:
         out: list[AsyncSandbox] = []

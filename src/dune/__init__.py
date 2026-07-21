@@ -1,5 +1,6 @@
 from ._models import (
     ExecResult,
+    FailureReason,
     NetworkMode,
     NetworkPolicy,
     SandboxParams,
@@ -35,6 +36,7 @@ __all__ = [
     "Sandbox",
     "AsyncSandbox",
     "SandboxState",
+    "FailureReason",
     "ExecResult",
     "SSHAccess",
     "SSHAccessValidation",
@@ -56,4 +58,4 @@ __all__ = [
     "DuneValidationError",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

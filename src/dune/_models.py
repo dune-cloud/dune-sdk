@@ -42,10 +42,20 @@ def validate_public_cidrs(cidrs: Iterable[str]) -> None:
 
 
 class SandboxState(StrEnum):
-    PENDING = "PENDING"
-    STARTED = "STARTED"
-    ERROR = "ERROR"
-    DELETED = "DELETED"
+    PENDING = "pending"
+    READY = "ready"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    NOT_FOUND = "not_found"
+
+
+class FailureReason(StrEnum):
+    DEADLINE_EXCEEDED = "deadline_exceeded"
+    EVICTED = "evicted"
+    OOM_KILLED = "oom_killed"
+    POD_FAILED = "pod_failed"
+    CONTAINER_TERMINATED = "container_terminated"
+    STARTUP_FAILED = "startup_failed"
 
 
 @dataclass

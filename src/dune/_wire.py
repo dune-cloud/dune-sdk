@@ -34,6 +34,22 @@ class ErrorResponse(BaseModel):
     message: str = Field(..., title='Message')
 
 
+class ExtendSandboxRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    seconds: conint(le=604800, gt=0) = Field(..., title='Seconds')
+
+
+class FailureReason(StrEnum):
+    deadline_exceeded = 'deadline_exceeded'
+    evicted = 'evicted'
+    oom_killed = 'oom_killed'
+    pod_failed = 'pod_failed'
+    container_terminated = 'container_terminated'
+    startup_failed = 'startup_failed'
+
+
 class NetworkMode(StrEnum):
     open = 'open'
     blocklist = 'blocklist'
@@ -54,10 +70,11 @@ class NetworkPolicyResponse(BaseModel):
 
 
 class SandboxState(StrEnum):
-    PENDING = 'PENDING'
-    STARTED = 'STARTED'
-    ERROR = 'ERROR'
-    DELETED = 'DELETED'
+    pending = 'pending'
+    ready = 'ready'
+    completed = 'completed'
+    failed = 'failed'
+    not_found = 'not_found'
 
 
 class StatusRequest(BaseModel):
@@ -105,6 +122,9 @@ class SandboxResponse(BaseModel):
     auto_delete_after_seconds: int | None = Field(
         None, title='Auto Delete After Seconds'
     )
+    termination_reason: str | None = Field(None, title='Termination Reason')
+    failure_reason: FailureReason | None = None
+    app_oom: bool | None = Field(False, title='App Oom')
 
 
 class BatchSandboxResponse(BaseModel):

@@ -6,12 +6,14 @@ import os
 import tempfile
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from . import _ssh_wire, _wire
 from ._codec import build_request, parse_response, to_payload
 from ._models import (
     ExecResult,
+    FailureReason,
     SandboxState,
     SSHAccess,
     SSHAccessValidation,
@@ -61,6 +63,22 @@ def _ssh_token_body(token: str) -> dict[str, Any]:
 def _apply_wire(sb: Sandbox | AsyncSandbox, data: dict[str, Any]) -> None:
     m = parse_response(_wire.SandboxResponse, data)
     sb.state = SandboxState(m.state)
+    sb.termination_reason = m.termination_reason
+    sb.failure_reason = FailureReason(m.failure_reason) if m.failure_reason else None
+    sb.app_oom = m.app_oom
+    sb.auto_delete_after_seconds = m.auto_delete_after_seconds
+
+
+def _deadline_far_enough(sb: Sandbox | AsyncSandbox) -> bool:
+    if not sb.created_at or not sb.auto_delete_after_seconds:
+        return False
+    deadline = datetime.fromisoformat(sb.created_at) + timedelta(
+        seconds=sb.auto_delete_after_seconds
+    )
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    margin = timedelta(seconds=sb.auto_extend_seconds or 0)
+    return deadline >= datetime.now(timezone.utc) + margin
 
 
 # --------------------------------------------------------------------------- #
@@ -69,9 +87,10 @@ def _apply_wire(sb: Sandbox | AsyncSandbox, data: dict[str, Any]) -> None:
 
 
 class _ProcessSync:
-    def __init__(self, http: SyncHttpClient, sandbox_id: str) -> None:
+    def __init__(self, http: SyncHttpClient, sandbox_id: str, keepalive: Any) -> None:
         self._http = http
         self._sid = sandbox_id
+        self._keepalive = keepalive
 
     def exec(
         self,
@@ -81,6 +100,7 @@ class _ProcessSync:
         env: dict[str, str] | None = None,
         timeout: int | None = None,
     ) -> ExecResult:
+        self._keepalive()
         body = exec_to_wire(command, cwd=cwd, env=env, timeout=timeout)
         data = self._http.post_json(
             f"/v1/sandboxes/{self._sid}/exec",
@@ -91,9 +111,10 @@ class _ProcessSync:
 
 
 class _ProcessAsync:
-    def __init__(self, http: AsyncHttpClient, sandbox_id: str) -> None:
+    def __init__(self, http: AsyncHttpClient, sandbox_id: str, keepalive: Any) -> None:
         self._http = http
         self._sid = sandbox_id
+        self._keepalive = keepalive
 
     async def exec(
         self,
@@ -103,6 +124,7 @@ class _ProcessAsync:
         env: dict[str, str] | None = None,
         timeout: int | None = None,
     ) -> ExecResult:
+        await self._keepalive()
         body = exec_to_wire(command, cwd=cwd, env=env, timeout=timeout)
         data = await self._http.post_json(
             f"/v1/sandboxes/{self._sid}/exec",
@@ -157,9 +179,10 @@ def _unlink_quiet(path: str) -> None:
 
 
 class _FileSystemSync:
-    def __init__(self, http: SyncHttpClient, sandbox_id: str) -> None:
+    def __init__(self, http: SyncHttpClient, sandbox_id: str, keepalive: Any) -> None:
         self._http = http
         self._sid = sandbox_id
+        self._keepalive = keepalive
 
     def _upload_params(self, path: str, replace_if_exist: bool, create_parents: bool) -> dict[str, Any]:
         return {
@@ -177,6 +200,7 @@ class _FileSystemSync:
         create_parents: bool = True,
         timeout: int | None = None,
     ) -> None:
+        self._keepalive()
         self._http.request(
             "POST",
             _files_url(self._sid, "upload"),
@@ -195,6 +219,7 @@ class _FileSystemSync:
         create_parents: bool = True,
         timeout: int | None = None,
     ) -> None:
+        self._keepalive()
         with open(local_path, "rb") as f:
             self._http.request(
                 "POST",
@@ -206,6 +231,7 @@ class _FileSystemSync:
             )
 
     def download_bytes(self, remote_path: str, *, timeout: int | None = None) -> bytes:
+        self._keepalive()
         buf = io.BytesIO()
         self._http.download_to(
             _files_url(self._sid, "download"),
@@ -227,6 +253,7 @@ class _FileSystemSync:
         fd, tmp = _open_dest(local_path, replace_if_exist=replace_if_exist, create_parents=create_parents)
         try:
             with os.fdopen(fd, "wb") as f:
+                self._keepalive()
                 self._http.download_to(
                     _files_url(self._sid, "download"),
                     f,
@@ -258,9 +285,10 @@ class _FileSystemSync:
 
 
 class _FileSystemAsync:
-    def __init__(self, http: AsyncHttpClient, sandbox_id: str) -> None:
+    def __init__(self, http: AsyncHttpClient, sandbox_id: str, keepalive: Any) -> None:
         self._http = http
         self._sid = sandbox_id
+        self._keepalive = keepalive
 
     def _upload_params(self, path: str, replace_if_exist: bool, create_parents: bool) -> dict[str, Any]:
         return {
@@ -278,6 +306,7 @@ class _FileSystemAsync:
         create_parents: bool = True,
         timeout: int | None = None,
     ) -> None:
+        await self._keepalive()
         await self._http.request(
             "POST",
             _files_url(self._sid, "upload"),
@@ -296,6 +325,7 @@ class _FileSystemAsync:
         create_parents: bool = True,
         timeout: int | None = None,
     ) -> None:
+        await self._keepalive()
         with open(local_path, "rb") as f:
             await self._http.request(
                 "POST",
@@ -307,6 +337,7 @@ class _FileSystemAsync:
             )
 
     async def download_bytes(self, remote_path: str, *, timeout: int | None = None) -> bytes:
+        await self._keepalive()
         buf = io.BytesIO()
         await self._http.download_to(
             _files_url(self._sid, "download"),
@@ -328,6 +359,7 @@ class _FileSystemAsync:
         fd, tmp = _open_dest(local_path, replace_if_exist=replace_if_exist, create_parents=create_parents)
         try:
             with os.fdopen(fd, "wb") as f:
+                await self._keepalive()
                 await self._http.download_to(
                     _files_url(self._sid, "download"),
                     f,
@@ -379,17 +411,30 @@ class Sandbox:
     memory: int | None = None
     disk: int | None = None
     auto_delete_after_seconds: int | None = None
+    termination_reason: str | None = None
+    failure_reason: FailureReason | None = None
+    app_oom: bool = False
+    auto_extend_seconds: int | None = None
 
     process: _ProcessSync = field(init=False, repr=False, compare=False)
     fs: _FileSystemSync = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.process = _ProcessSync(self._data_http, self.id)
-        self.fs = _FileSystemSync(self._data_http, self.id)
+        self.process = _ProcessSync(self._data_http, self.id, self._keepalive)
+        self.fs = _FileSystemSync(self._data_http, self.id, self._keepalive)
 
-    def _refresh(self) -> None:
+    def refresh(self) -> None:
         data = self._http.get_json(f"/v1/sandboxes/{self.id}")
         _apply_wire(self, data)
+
+    def extend(self, seconds: int) -> None:
+        data = self._http.post_json(f"/v1/sandboxes/{self.id}/extend", {"seconds": seconds})
+        _apply_wire(self, data)
+
+    def _keepalive(self) -> None:
+        if self.auto_extend_seconds is None or _deadline_far_enough(self):
+            return
+        self.extend(self.auto_extend_seconds)
 
     # ----- SSH access (always synchronous) ----------------------------------
 
@@ -428,17 +473,30 @@ class AsyncSandbox:
     memory: int | None = None
     disk: int | None = None
     auto_delete_after_seconds: int | None = None
+    termination_reason: str | None = None
+    failure_reason: FailureReason | None = None
+    app_oom: bool = False
+    auto_extend_seconds: int | None = None
 
     process: _ProcessAsync = field(init=False, repr=False, compare=False)
     fs: _FileSystemAsync = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.process = _ProcessAsync(self._adata_http, self.id)
-        self.fs = _FileSystemAsync(self._adata_http, self.id)
+        self.process = _ProcessAsync(self._adata_http, self.id, self._keepalive)
+        self.fs = _FileSystemAsync(self._adata_http, self.id, self._keepalive)
 
-    async def _refresh(self) -> None:
+    async def refresh(self) -> None:
         data = await self._ahttp.get_json(f"/v1/sandboxes/{self.id}")
         _apply_wire(self, data)
+
+    async def extend(self, seconds: int) -> None:
+        data = await self._ahttp.post_json(f"/v1/sandboxes/{self.id}/extend", {"seconds": seconds})
+        _apply_wire(self, data)
+
+    async def _keepalive(self) -> None:
+        if self.auto_extend_seconds is None or _deadline_far_enough(self):
+            return
+        await self.extend(self.auto_extend_seconds)
 
     # ----- SSH access (always synchronous) ----------------------------------
 
@@ -479,6 +537,9 @@ def sandbox_from_wire(
         memory=m.memory,
         disk=m.disk,
         auto_delete_after_seconds=m.auto_delete_after_seconds,
+        termination_reason=m.termination_reason,
+        failure_reason=FailureReason(m.failure_reason) if m.failure_reason else None,
+        app_oom=m.app_oom,
     )
 
 
@@ -506,4 +567,7 @@ def async_sandbox_from_wire(
         memory=m.memory,
         disk=m.disk,
         auto_delete_after_seconds=m.auto_delete_after_seconds,
+        termination_reason=m.termination_reason,
+        failure_reason=FailureReason(m.failure_reason) if m.failure_reason else None,
+        app_oom=m.app_oom,
     )
