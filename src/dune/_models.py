@@ -100,6 +100,47 @@ class ExecResult:
 
 
 @dataclass
+class SessionCommand:
+    id: str
+    command: str
+    exit_code: int | None = None
+    merge_stderr: bool = False
+    submitted_at: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    stdout_size: int = 0
+    stderr_size: int = 0
+
+    @property
+    def finished(self) -> bool:
+        return self.ended_at is not None
+
+    @property
+    def died(self) -> bool:
+        return self.ended_at is not None and self.exit_code is None
+
+
+@dataclass
+class SessionExecResult:
+    cmd_id: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+
+
+@dataclass
+class SessionInfo:
+    session_id: str
+    alive: bool = True
+    created_at: str | None = None
+    pid: int | None = None
+    cwd: str | None = None
+    command_count: int = 0
+    exit_status: str | None = None
+    commands: list[SessionCommand] = field(default_factory=list)
+
+
+@dataclass
 class SSHAccess:
     token: str = field(repr=False)
     gateway_url: str
@@ -156,6 +197,68 @@ def exec_result_from_wire(data: dict[str, Any]) -> ExecResult:
         stderr=m.stderr or "",
         duration_ms=m.duration_ms or 0,
     )
+
+
+def session_create_to_wire(
+    session_id: str, *, cwd: str | None, env: dict[str, str] | None
+) -> dict[str, Any]:
+    req = build_request(
+        _daemon_wire.SessionCreateRequest, session_id=session_id, cwd=cwd, env=env
+    )
+    return to_payload(req)
+
+
+def session_exec_to_wire(command: str, *, merge_stderr: bool) -> dict[str, Any]:
+    req = build_request(
+        _daemon_wire.SessionExecRequest,
+        command=command,
+        merge_stderr=merge_stderr or None,
+    )
+    return to_payload(req)
+
+
+def session_cmd_id_from_wire(data: dict[str, Any]) -> str:
+    return parse_response(_daemon_wire.SessionExecResponse, data).cmd_id
+
+
+def _session_command(m: Any) -> SessionCommand:
+    return SessionCommand(
+        id=m.id,
+        command=m.command,
+        exit_code=m.exit_code,
+        merge_stderr=m.merge_stderr,
+        submitted_at=m.submitted_at,
+        started_at=m.started_at,
+        ended_at=m.ended_at,
+        stdout_size=m.stdout_size,
+        stderr_size=m.stderr_size,
+    )
+
+
+def session_command_from_wire(data: dict[str, Any]) -> SessionCommand:
+    return _session_command(parse_response(_daemon_wire.SessionCommandModel, data))
+
+
+def _session_info(m: Any) -> SessionInfo:
+    return SessionInfo(
+        session_id=m.session_id,
+        alive=m.alive,
+        created_at=m.created_at,
+        pid=m.pid,
+        cwd=m.cwd,
+        command_count=m.command_count,
+        exit_status=m.exit_status,
+        commands=[_session_command(c) for c in m.commands],
+    )
+
+
+def session_info_from_wire(data: dict[str, Any]) -> SessionInfo:
+    return _session_info(parse_response(_daemon_wire.SessionModel, data))
+
+
+def session_list_from_wire(data: dict[str, Any]) -> list[SessionInfo]:
+    m = parse_response(_daemon_wire.SessionListResponse, data)
+    return [_session_info(s) for s in m.sessions]
 
 
 def ssh_access_from_wire(data: dict[str, Any]) -> SSHAccess:

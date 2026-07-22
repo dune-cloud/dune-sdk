@@ -5,6 +5,9 @@ from ._models import (
     NetworkPolicy,
     SandboxParams,
     SandboxState,
+    SessionCommand,
+    SessionExecResult,
+    SessionInfo,
     SSHAccess,
     SSHAccessValidation,
 )
@@ -24,7 +27,7 @@ from .errors import (
     DuneTransportError,
     DuneValidationError,
 )
-from .sandbox import AsyncSandbox, Sandbox
+from .sandbox import AsyncSandbox, Sandbox, Stream
 
 __all__ = [
     # Clients
@@ -38,6 +41,10 @@ __all__ = [
     "SandboxState",
     "FailureReason",
     "ExecResult",
+    "SessionCommand",
+    "SessionExecResult",
+    "SessionInfo",
+    "Stream",
     "SSHAccess",
     "SSHAccessValidation",
     # Network
@@ -58,4 +65,4 @@ __all__ = [
     "DuneValidationError",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"

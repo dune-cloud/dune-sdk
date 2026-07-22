@@ -4,10 +4,12 @@ import asyncio
 import io
 import os
 import tempfile
+import time
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from . import _ssh_wire, _wire
 from ._codec import build_request, parse_response, to_payload
@@ -15,14 +17,28 @@ from ._models import (
     ExecResult,
     FailureReason,
     SandboxState,
+    SessionCommand,
+    SessionExecResult,
+    SessionInfo,
     SSHAccess,
     SSHAccessValidation,
     exec_result_from_wire,
     exec_to_wire,
+    session_cmd_id_from_wire,
+    session_command_from_wire,
+    session_create_to_wire,
+    session_exec_to_wire,
+    session_info_from_wire,
+    session_list_from_wire,
     ssh_access_from_wire,
     ssh_validation_from_wire,
 )
-from .errors import DuneConflictError, DuneValidationError
+from .errors import (
+    DuneConflictError,
+    DuneConnectionError,
+    DuneTimeoutError,
+    DuneValidationError,
+)
 
 if TYPE_CHECKING:
     from ._http import AsyncHttpClient, SyncHttpClient
@@ -44,6 +60,28 @@ def _exec_total(timeout: int | None) -> int | None:
     if timeout is not None and timeout <= 0:
         raise DuneValidationError("timeout must be a positive number of seconds, or None for no timeout")
     return timeout + EXEC_GRACE if timeout else None
+
+
+_WAIT_CHUNK = 30
+_LOG_POLL = 0.2
+
+Stream = Literal["stdout", "stderr"]
+
+
+def _sessions_url(sid: str, tail: str = "") -> str:
+    return f"/v1/sandboxes/{sid}/sessions{tail}"
+
+
+def _cid(cmd: SessionCommand | str) -> str:
+    return cmd.id if isinstance(cmd, SessionCommand) else cmd
+
+
+def _new_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _decode(data: bytes) -> str:
+    return data.decode("utf-8", "replace")
 
 
 def _ssh_create_body(expires_in_minutes: int | None, evict_oldest: bool) -> dict[str, Any]:
@@ -109,6 +147,27 @@ class _ProcessSync:
         )
         return exec_result_from_wire(data)
 
+    def create_session(
+        self,
+        session_id: str | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> _SessionSync:
+        self._keepalive()
+        sid = session_id or _new_session_id()
+        self._http.post_json(
+            _sessions_url(self._sid), session_create_to_wire(sid, cwd=cwd, env=env)
+        )
+        return _SessionSync(self._http, self._sid, sid, self._keepalive)
+
+    def session(self, session_id: str) -> _SessionSync:
+        return _SessionSync(self._http, self._sid, session_id, self._keepalive)
+
+    def sessions(self) -> list[SessionInfo]:
+        self._keepalive()
+        return session_list_from_wire(self._http.get_json(_sessions_url(self._sid)))
+
 
 class _ProcessAsync:
     def __init__(self, http: AsyncHttpClient, sandbox_id: str, keepalive: Any) -> None:
@@ -132,6 +191,27 @@ class _ProcessAsync:
             timeout=_exec_total(timeout),
         )
         return exec_result_from_wire(data)
+
+    async def create_session(
+        self,
+        session_id: str | None = None,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> _SessionAsync:
+        await self._keepalive()
+        sid = session_id or _new_session_id()
+        await self._http.post_json(
+            _sessions_url(self._sid), session_create_to_wire(sid, cwd=cwd, env=env)
+        )
+        return _SessionAsync(self._http, self._sid, sid, self._keepalive)
+
+    def session(self, session_id: str) -> _SessionAsync:
+        return _SessionAsync(self._http, self._sid, session_id, self._keepalive)
+
+    async def sessions(self) -> list[SessionInfo]:
+        await self._keepalive()
+        return session_list_from_wire(await self._http.get_json(_sessions_url(self._sid)))
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +468,221 @@ class _FileSystemAsync:
             content.encode(encoding), remote_path, replace_if_exist=replace_if_exist,
             create_parents=create_parents, timeout=timeout,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Sessions
+# --------------------------------------------------------------------------- #
+
+
+class _SessionSync:
+    def __init__(self, http: SyncHttpClient, sandbox_id: str, session_id: str, keepalive: Any) -> None:
+        self._http = http
+        self._sid = sandbox_id
+        self.id = session_id
+        self._keepalive = keepalive
+
+    def __enter__(self) -> _SessionSync:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.delete()
+
+    def _url(self, tail: str = "") -> str:
+        return _sessions_url(self._sid, f"/{self.id}{tail}")
+
+    def exec_async(self, command: str, *, merge_stderr: bool = False) -> SessionCommand:
+        self._keepalive()
+        data = self._http.post_json(
+            self._url("/exec"), session_exec_to_wire(command, merge_stderr=merge_stderr)
+        )
+        return SessionCommand(
+            id=session_cmd_id_from_wire(data), command=command, merge_stderr=merge_stderr
+        )
+
+    def exec(
+        self,
+        command: str,
+        *,
+        wait_timeout: int | None = None,
+        merge_stderr: bool = False,
+    ) -> SessionExecResult:
+        cmd = self.exec_async(command, merge_stderr=merge_stderr)
+        rec = self.wait(cmd, timeout=wait_timeout)
+        stdout = _decode(self.logs(rec, "stdout")) if rec.stdout_size else ""
+        stderr = "" if rec.merge_stderr or not rec.stderr_size else _decode(self.logs(rec, "stderr"))
+        return SessionExecResult(
+            cmd_id=rec.id, exit_code=rec.exit_code, stdout=stdout, stderr=stderr
+        )
+
+    def command(self, cmd: SessionCommand | str) -> SessionCommand:
+        self._keepalive()
+        return session_command_from_wire(self._http.get_json(self._url(f"/commands/{_cid(cmd)}")))
+
+    def wait(self, cmd: SessionCommand | str, *, timeout: int | None = None) -> SessionCommand:
+        cid = _cid(cmd)
+        deadline = time.monotonic() + timeout if timeout else None
+        while True:
+            remaining = (deadline - time.monotonic()) if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise DuneTimeoutError(f"command {cid} is still running", pending=[cid])
+            chunk = _WAIT_CHUNK if remaining is None else max(1, min(_WAIT_CHUNK, int(remaining)))
+            self._keepalive()
+            try:
+                data = self._http.get_json(
+                    self._url(f"/commands/{cid}"),
+                    params={"wait": 1, "wait_timeout_seconds": chunk},
+                    timeout=chunk + EXEC_GRACE,
+                )
+            except (DuneTimeoutError, DuneConnectionError):
+                continue
+            rec = session_command_from_wire(data)
+            if rec.finished:
+                return rec
+
+    def logs(self, cmd: SessionCommand | str, stream: Stream = "stdout", *, offset: int = 0) -> bytes:
+        self._keepalive()
+        resp = self._http.request(
+            "GET",
+            self._url(f"/commands/{_cid(cmd)}/logs"),
+            params={"stream": stream, "offset": offset},
+        )
+        return resp.data
+
+    def stream_logs(
+        self, cmd: SessionCommand | str, stream: Stream = "stdout", *, poll: float = _LOG_POLL
+    ) -> Iterator[bytes]:
+        cid = _cid(cmd)
+        offset = 0
+        while True:
+            chunk = self.logs(cid, stream, offset=offset)
+            if chunk:
+                offset += len(chunk)
+                yield chunk
+                continue
+            if self.command(cid).finished:
+                tail = self.logs(cid, stream, offset=offset)
+                if not tail:
+                    return
+                offset += len(tail)
+                yield tail
+                continue
+            time.sleep(poll)
+
+    def info(self) -> SessionInfo:
+        self._keepalive()
+        return session_info_from_wire(self._http.get_json(self._url()))
+
+    def delete(self) -> None:
+        self._http.delete(self._url())
+
+
+class _SessionAsync:
+    def __init__(self, http: AsyncHttpClient, sandbox_id: str, session_id: str, keepalive: Any) -> None:
+        self._http = http
+        self._sid = sandbox_id
+        self.id = session_id
+        self._keepalive = keepalive
+
+    async def __aenter__(self) -> _SessionAsync:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.delete()
+
+    def _url(self, tail: str = "") -> str:
+        return _sessions_url(self._sid, f"/{self.id}{tail}")
+
+    async def exec_async(self, command: str, *, merge_stderr: bool = False) -> SessionCommand:
+        await self._keepalive()
+        data = await self._http.post_json(
+            self._url("/exec"), session_exec_to_wire(command, merge_stderr=merge_stderr)
+        )
+        return SessionCommand(
+            id=session_cmd_id_from_wire(data), command=command, merge_stderr=merge_stderr
+        )
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        wait_timeout: int | None = None,
+        merge_stderr: bool = False,
+    ) -> SessionExecResult:
+        cmd = await self.exec_async(command, merge_stderr=merge_stderr)
+        rec = await self.wait(cmd, timeout=wait_timeout)
+        stdout = _decode(await self.logs(rec, "stdout")) if rec.stdout_size else ""
+        stderr = (
+            "" if rec.merge_stderr or not rec.stderr_size else _decode(await self.logs(rec, "stderr"))
+        )
+        return SessionExecResult(
+            cmd_id=rec.id, exit_code=rec.exit_code, stdout=stdout, stderr=stderr
+        )
+
+    async def command(self, cmd: SessionCommand | str) -> SessionCommand:
+        await self._keepalive()
+        return session_command_from_wire(
+            await self._http.get_json(self._url(f"/commands/{_cid(cmd)}"))
+        )
+
+    async def wait(self, cmd: SessionCommand | str, *, timeout: int | None = None) -> SessionCommand:
+        cid = _cid(cmd)
+        deadline = time.monotonic() + timeout if timeout else None
+        while True:
+            remaining = (deadline - time.monotonic()) if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise DuneTimeoutError(f"command {cid} is still running", pending=[cid])
+            chunk = _WAIT_CHUNK if remaining is None else max(1, min(_WAIT_CHUNK, int(remaining)))
+            await self._keepalive()
+            try:
+                data = await self._http.get_json(
+                    self._url(f"/commands/{cid}"),
+                    params={"wait": 1, "wait_timeout_seconds": chunk},
+                    timeout=chunk + EXEC_GRACE,
+                )
+            except (DuneTimeoutError, DuneConnectionError):
+                continue
+            rec = session_command_from_wire(data)
+            if rec.finished:
+                return rec
+
+    async def logs(
+        self, cmd: SessionCommand | str, stream: Stream = "stdout", *, offset: int = 0
+    ) -> bytes:
+        await self._keepalive()
+        resp = await self._http.request(
+            "GET",
+            self._url(f"/commands/{_cid(cmd)}/logs"),
+            params={"stream": stream, "offset": offset},
+        )
+        return resp.data
+
+    async def stream_logs(
+        self, cmd: SessionCommand | str, stream: Stream = "stdout", *, poll: float = _LOG_POLL
+    ) -> AsyncIterator[bytes]:
+        cid = _cid(cmd)
+        offset = 0
+        while True:
+            chunk = await self.logs(cid, stream, offset=offset)
+            if chunk:
+                offset += len(chunk)
+                yield chunk
+                continue
+            if (await self.command(cid)).finished:
+                tail = await self.logs(cid, stream, offset=offset)
+                if not tail:
+                    return
+                offset += len(tail)
+                yield tail
+                continue
+            await asyncio.sleep(poll)
+
+    async def info(self) -> SessionInfo:
+        await self._keepalive()
+        return session_info_from_wire(await self._http.get_json(self._url()))
+
+    async def delete(self) -> None:
+        await self._http.delete(self._url())
 
 
 # --------------------------------------------------------------------------- #
